@@ -1,0 +1,323 @@
+
+generator client {
+  provider = "prisma-client-js"
+}
+// Provider is set automatically by scripts/prisma-provider.mjs from DATABASE_URL:
+// "file:..." -> sqlite (local), "postgres..." -> postgresql (Neon). Keep models portable (no Json/enums).
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  handle    String   @unique // display name, e.g. TR/\2HY
+  slug      String   @unique // URL-safe name used in /artist/[slug]
+  bio       String?
+  location  String?
+  avatarKey  String?  // stored avatar (art/...)
+  avatarHref String?  // public avatar URL when stored in Vercel Blob
+  email     String?  @unique
+  soundCloudId String?
+  soundCloudSync SoundCloudSync?
+  passwordHash String?
+  profileClaimed Boolean @default(false)
+  stripeAccountId String?
+  stripeOnboarded Boolean @default(false)
+  plan      String   @default("free") // free, pro
+  tracks    Track[]
+  playlists Playlist[]
+  projects  Project[]
+  generations Generation[]
+  sessions  Session[]
+  notifications Notification[]
+  contributions Contribution[]
+  listeningHistory ListeningHistory[]
+  commentsAuthored TimedComment[]
+  followers Follow[]
+  createdAt DateTime @default(now())
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId, expiresAt])
+}
+
+model DeletedProfile {
+  id        String   @id
+  deletedAt DateTime @default(now())
+}
+
+model Track {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id])
+  title         String
+  genre         String?
+  description   String?
+  artKey        String?  // stored artwork (art/...)
+  artHref       String?  // public artwork URL when stored in Vercel Blob
+  audioHref     String?  // public audio URL when stored in Vercel Blob
+  s3Key         String
+  contentType   String   @default("audio/mpeg")
+  hlsKey        String?
+  waveformJson  String?  // peaks
+  waveformUrl   String?  // SoundCloud's per-track waveform image
+  duration      Float
+  lufs          Float?   // loudness
+  plays         Int      @default(0)
+  scUrl         String?  // original SoundCloud link
+  appleMusicUrl String?
+  spotifyUrl    String?
+  soundCloudTrackId String?
+  scSyncedAt    DateTime?
+  scAccess      String?
+  scStatsHidden Boolean @default(false)
+  scCommentsHidden Boolean @default(false)
+  scPlays       Int      @default(0) // plays carried over from SoundCloud (artist-reported)
+  scLikes       Int      @default(0)
+  scComments    Int      @default(0)
+  scReposts     Int      @default(0)
+  downloadable  Boolean  @default(false) // lets listeners download the original file
+  published     Boolean  @default(true)
+  publishedAt   DateTime?
+  scheduledFor  DateTime? // future release time for a still-private draft; auto-publishes once due
+  createdAt     DateTime @default(now())
+  timedComments TimedComment[]
+  masters       Master[]
+  playEvents    PlayEvent[]
+  likes         Like[]
+  reposts       Repost[]
+  contributions Contribution[]
+  listeningHistory ListeningHistory[]
+  playlistTracks PlaylistTrack[]
+
+  @@index([createdAt])
+  @@index([userId, soundCloudTrackId])
+}
+
+model SoundCloudSync {
+  userId          String   @id
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sourceUserId    String
+  profileUrl      String
+  enabled         Boolean  @default(false)
+  importNew       Boolean  @default(false)
+  syncedAt        DateTime?
+  nextSyncAt      DateTime @default(now())
+  lockId          String?
+  lockedUntil     DateTime?
+  error           String?
+  followers       Int?
+  publicTracks    Int?
+  sourcePlays     Int?
+
+  @@index([enabled, nextSyncAt])
+}
+
+model SoundCloudApiSession {
+  id              String   @id
+  encryptedTokens String?
+  expiresAt       DateTime?
+  lockId          String?
+  lockedUntil     DateTime?
+  retryAfter      DateTime?
+}
+
+model Repost {
+  id        String   @id @default(cuid())
+  trackId   String
+  track     Track    @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  listener  String
+  createdAt DateTime @default(now())
+
+  @@unique([trackId, listener])
+}
+
+model Playlist {
+  id          String   @id @default(cuid())
+  soundCloudId String?
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  title       String
+  description String?
+  artKey      String?
+  artHref     String?
+  tracks      PlaylistTrack[]
+  createdAt   DateTime @default(now())
+
+  @@index([userId])
+  @@index([userId, soundCloudId])
+}
+
+model PlaylistTrack {
+  id         String   @id @default(cuid())
+  playlistId String
+  playlist   Playlist @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+  trackId    String
+  track      Track    @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  position   Int
+  addedAt    DateTime @default(now())
+
+  @@unique([playlistId, trackId])
+  @@index([playlistId, position])
+}
+
+// Listener = anonymous cookie id until real accounts exist.
+model Like {
+  id        String   @id @default(cuid())
+  trackId   String
+  track     Track    @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  listener  String
+  createdAt DateTime @default(now())
+
+  @@unique([trackId, listener])
+}
+
+model Follow {
+  id        String   @id @default(cuid())
+  artistId  String
+  artist    User     @relation(fields: [artistId], references: [id], onDelete: Cascade)
+  listener  String
+  createdAt DateTime @default(now())
+
+  @@unique([artistId, listener])
+}
+
+model PlayEvent {
+  id        String   @id @default(cuid())
+  trackId   String
+  track     Track    @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  visitor   String   // salted hash, used only to de-duplicate repeat plays
+  createdAt DateTime @default(now())
+
+  @@index([trackId, visitor, createdAt])
+}
+
+model TimedComment {
+  id        String   @id @default(cuid())
+  trackId   String
+  track     Track    @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  name      String   @default("Listener")
+  timestampMs Int    // for waveform dot
+  text      String
+  createdAt DateTime @default(now())
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trackId   String?
+  type      String
+  message   String
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+model Contribution {
+  id              String   @id @default(cuid())
+  trackId         String
+  track           Track    @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  artistId        String
+  artist          User     @relation(fields: [artistId], references: [id], onDelete: Cascade)
+  amountCents     Int
+  currency        String   @default("usd")
+  stripeSessionId String?  @unique
+  status          String   @default("pending")
+  createdAt       DateTime @default(now())
+
+  @@index([artistId, createdAt])
+  @@index([trackId, createdAt])
+}
+
+model ListeningHistory {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trackId      String
+  track        Track    @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  playCount    Int      @default(1)
+  lastPlayedAt DateTime @default(now())
+
+  @@unique([userId, trackId])
+  @@index([userId, lastPlayedAt])
+}
+
+model Project {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  name      String
+  bpm       Int      @default(120)
+  key       String   @default("C")
+  stems     Stem[]
+  createdAt DateTime @default(now())
+}
+
+model Generation {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id])
+  prompt     String
+  lyrics     String?
+  style      String?
+  genre      String?
+  mood       String?
+  bpm        Int?
+  duration   Int
+  weirdness  Int      @default(50)
+  influence  Int      @default(50)
+  instrumental Boolean @default(true)
+  status     String   @default("queued") // queued, processing, succeeded, failed
+  providerId String?  @unique
+  outputUrl  String?
+  error      String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([userId, createdAt])
+}
+
+model Stem {
+  id          String   @id @default(cuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id])
+  name        String
+  s3Key       String
+  volume      Float    @default(0.8)
+  pan         Float    @default(0)
+  effectsJson String?  // {eq, comp, reverb}
+}
+
+model Master {
+  id              String   @id @default(cuid())
+  trackId         String
+  track           Track    @relation(fields: [trackId], references: [id])
+  presetEq        String   // Warm, Balanced, Bright
+  presetIntensity String   // Soft, Medium, Hard
+  lufsTarget      Float    @default(-14)
+  s3Key           String?
+  createdAt       DateTime @default(now())
+}
+
+model VocalChain {
+  id          String   @id @default(cuid())
+  userId      String
+  key         String   @default("C")
+  scale       String   @default("major")
+  retuneSpeed Int      @default(50)
+  harmonyMode String   @default("off") // off, third, fifth, octave
+  effects     String?  // robot, telephone, chorus
+  createdAt   DateTime @default(now())
+}

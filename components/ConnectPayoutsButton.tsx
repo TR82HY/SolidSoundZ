@@ -1,0 +1,4 @@
+'use client'
+import { useState } from 'react'
+
+export default function ConnectPayoutsButton() { const [busy, setBusy] = useState(false); const [error, setError] = useState(''); const connect = async () => { setBusy(true); setError(''); try { const response = await fetch('/api/stripe/connect', { method: 'POST' }); const data = await response.json().catch(() => ({})); if (!response.ok || !data.url) { setError(data.error || 'Payout setup unavailable'); return }; location.assign(data.url) } finally { setBusy(false) } }; return <div><button onClick={connect} disabled={busy} className="bg-[#d8ff16] px-4 py-3 text-xs font-bold uppercase tracking-[0.1em] text-black disabled:opacity-40">{busy ? 'Opening Stripe...' : 'Connect payouts'}</button>{error && <p className="mt-2 text-xs text-[#ff9d89]">{error}</p>}</div> }

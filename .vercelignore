@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+storage/
+prisma/*.db
+prisma/*.db-journal
+node_modules/
+.next/
+*.log
+docs/SOUNDCLOUD-COMPARISON-AND-REVENUE-PLAN.md
