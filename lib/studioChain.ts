@@ -14,6 +14,8 @@ export type Settings = {
   width: number          // stereo width %
   outputGain: number     // dB (set by loudness matching)
   ceiling: number        // dBFS limiter ceiling
+  limiterRelease: number // ms (Orbit: 10..250, default 80)
+  lookahead: boolean     // render-time lookahead limiting (Orbit: 5 ms)
 }
 
 export const EQ_BANDS = [
@@ -27,7 +29,7 @@ export const EQ_BANDS = [
 export const DEFAULTS: Settings = {
   inputGain: 0, lowCut: 20, eq: [0, 0, 0, 0, 0], megaBass: 0, drive: 0, satMix: 100,
   compThreshold: -18, compRatio: 2, compAttack: 20, compRelease: 200, compKnee: 6, makeup: 0,
-  width: 100, outputGain: 0, ceiling: -1,
+  width: 100, outputGain: 0, ceiling: -1, limiterRelease: 80, lookahead: true,
 }
 
 export function parseStudioSettings(value: unknown): Settings {
@@ -39,7 +41,7 @@ export function parseStudioSettings(value: unknown): Settings {
     ['drive', 0, 100], ['satMix', 0, 100], ['compThreshold', -48, 0],
     ['compRatio', 1, 20], ['compAttack', 0.5, 100], ['compRelease', 20, 1000],
     ['compKnee', 0, 30], ['makeup', -12, 12], ['width', 0, 200],
-    ['outputGain', -12, 24], ['ceiling', -3, 0],
+    ['outputGain', -12, 24], ['ceiling', -3, 0], ['limiterRelease', 10, 250],
   ] as const
   for (const [key, min, max] of bounds) {
     if (!(key in data)) continue
@@ -48,6 +50,10 @@ export function parseStudioSettings(value: unknown): Settings {
       throw new Error('Invalid saved Studio settings')
     }
     settings[key] = number
+  }
+  if ('lookahead' in data) {
+    if (typeof data.lookahead !== 'boolean') throw new Error('Invalid saved Studio settings')
+    settings.lookahead = data.lookahead
   }
   if ('eq' in data) {
     if (!Array.isArray(data.eq) || data.eq.length !== EQ_BANDS.length
@@ -146,9 +152,42 @@ export function buildChain(ctx: BaseAudioContext): Chain {
     ll.gain.value = a; rr.gain.value = a; lr.gain.value = b; rl.gain.value = b
     out.gain.value = dbToLin(s.outputGain)
     limiter.threshold.value = s.ceiling - 0.5
+    limiter.release.value = s.limiterRelease / 1000
     if (s.ceiling !== lastCeiling) { clipper.curve = clipCurve(dbToLin(s.ceiling)); lastCeiling = s.ceiling }
   }
   return { input, output, trim, set }
+}
+
+// Orbit-style lookahead limiter, applied to a rendered buffer as a final
+// safety pass. 5 ms lookahead; gain only ever reduces, never boosts.
+export function applyLookaheadLimit(channels: Float32Array[], sampleRate: number, ceilingDb: number, releaseMs: number) {
+  const ceiling = dbToLin(ceilingDb)
+  const frames = channels[0].length
+  const lookAhead = Math.max(1, Math.round(sampleRate * 0.005))
+  const releaseCoefficient = 1 - Math.exp(-1 / ((releaseMs / 1000) * sampleRate))
+  const peakByFrame = new Float32Array(frames)
+  for (let frame = 0; frame < frames; frame++) {
+    let peak = 0
+    for (const channel of channels) {
+      const value = Math.abs(channel[frame])
+      if (value > peak) peak = value
+    }
+    peakByFrame[frame] = peak
+  }
+  const deque = new Uint32Array(frames)
+  let head = 0, tail = 0, currentGain = 1
+  for (let frame = frames - 1; frame >= 0; frame--) {
+    while (tail > head && peakByFrame[deque[tail - 1]] <= peakByFrame[frame]) tail--
+    deque[tail++] = frame
+    while (tail > head && deque[head] > frame + lookAhead) head++
+    const futurePeak = peakByFrame[deque[head]]
+    const desiredGain = futurePeak > ceiling ? ceiling / futurePeak : 1
+    if (desiredGain < currentGain) currentGain = desiredGain
+    else currentGain += (desiredGain - currentGain) * releaseCoefficient
+    for (const channel of channels) {
+      channel[frame] = Math.max(-1, Math.min(1, channel[frame] * currentGain))
+    }
+  }
 }
 
 export async function renderMaster(buf: AudioBuffer, s: Settings) {
@@ -160,5 +199,10 @@ export async function renderMaster(buf: AudioBuffer, s: Settings) {
   src.connect(chain.input)
   chain.output.connect(off.destination)
   src.start()
-  return off.startRendering()
+  const rendered = await off.startRendering()
+  if (s.lookahead) {
+    const channels = Array.from({ length: rendered.numberOfChannels }, (_, i) => rendered.getChannelData(i))
+    applyLookaheadLimit(channels, rendered.sampleRate, s.ceiling, s.limiterRelease)
+  }
+  return rendered
 }

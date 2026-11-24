@@ -15,8 +15,11 @@ export function encodeWav(buf: AudioBuffer, bits: 16 | 24 | 32 = 16): Blob {
     const s = Math.max(-1, Math.min(1, data[c][i]))
     if (bits === 32) view.setFloat32(o, s, true)
     else if (bits === 24) {
-      const v = Math.round(s < 0 ? s * 0x800000 : s * 0x7fffff)
-      view.setUint8(o, v & 0xff); view.setUint8(o + 1, (v >> 8) & 0xff); view.setUint8(o + 2, (v >> 16) & 0xff)
+      // TPDF dither, same as Orbit Master: decorrelates quantization error.
+      const dither = Math.random() - Math.random()
+      const v = Math.max(-0x800000, Math.min(0x7fffff, Math.round(s * 0x800000 + dither)))
+      const u = v < 0 ? v + 0x1000000 : v
+      view.setUint8(o, u & 0xff); view.setUint8(o + 1, (u >> 8) & 0xff); view.setUint8(o + 2, (u >> 16) & 0xff)
     } else view.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true)
     o += bytes
   }
@@ -61,15 +64,95 @@ export async function resample(buf: AudioBuffer, rate: number): Promise<AudioBuf
   return off.startRendering()
 }
 
-export async function exportAudio(buf: AudioBuffer, format: FormatId, name: string, signal?: AbortSignal) {
-  if (signal?.aborted) throw new DOMException('Export canceled', 'AbortError')
+// Renders the export bytes without downloading, so the caller can validate
+// them (see validateWav) before offering the download.
+export async function renderExportBlob(buf: AudioBuffer, format: FormatId, keepSourceRate = false): Promise<{ blob: Blob, out: AudioBuffer }> {
   const f = FORMATS.find(x => x.id === format)!
-  const out = await resample(buf, f.rate)
-  if (signal?.aborted) throw new DOMException('Export canceled', 'AbortError')
+  const out = keepSourceRate ? buf : await resample(buf, f.rate)
   const blob = format === 'mp3' ? await encodeMp3(out, 320)
     : encodeWav(out, format === 'wav32' ? 32 : format === 'wav24' ? 24 : 16)
+  return { blob, out }
+}
+
+export async function exportAudio(buf: AudioBuffer, format: FormatId, name: string, signal?: AbortSignal, keepSourceRate = false) {
+  if (signal?.aborted) throw new DOMException('Export canceled', 'AbortError')
+  const f = FORMATS.find(x => x.id === format)!
+  const { blob } = await renderExportBlob(buf, format, keepSourceRate)
   if (signal?.aborted) throw new DOMException('Export canceled', 'AbortError')
   downloadBlob(blob, `${name}.${f.ext}`)
+}
+
+export type WavCheck = { label: string, pass: boolean, detail: string }
+export type WavFormat = 'float32' | 'pcm24' | 'pcm16'
+
+const formatLabel = (format: WavFormat) =>
+  format === 'float32' ? '32-bit float WAV' : format === 'pcm24' ? '24-bit PCM WAV' : '16-bit PCM WAV'
+const formatDb = (value: number) => value <= 0 ? '-inf dBFS' : `${(20 * Math.log10(value)).toFixed(2)} dBFS`
+
+// Ported from Orbit Master: validates an exported WAV before it is offered
+// for download. Checks the RIFF/WAVE structure, format tag + bit depth,
+// channels + sample rate, peak vs the limiter ceiling, and that the file
+// carries only fmt + data chunks (no source tags/artwork).
+export async function validateWav(blob: Blob, expected: { channelCount: number, frameCount: number, format: WavFormat, peakCeiling: number, sampleRate: number }): Promise<WavCheck[]> {
+  const bytes = new Uint8Array(await blob.arrayBuffer())
+  const view = new DataView(bytes.buffer)
+  const fourCC = (offset: number) => String.fromCharCode(bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3])
+  const checks: WavCheck[] = []
+  const addCheck = (label: string, pass: boolean, detail: string) => checks.push({ label, pass, detail })
+  const riffValid = bytes.length >= 44 && fourCC(0) === 'RIFF' && fourCC(8) === 'WAVE' && view.getUint32(4, true) + 8 === bytes.length
+  let offset = 12
+  let formatPayload = -1, formatSize = 0, dataPayload = -1, dataSize = 0
+  const chunks: string[] = []
+  let chunksValid = true
+  while (offset + 8 <= bytes.length) {
+    const id = fourCC(offset)
+    const size = view.getUint32(offset + 4, true)
+    const payload = offset + 8
+    if (payload + size > bytes.length) { chunksValid = false; break }
+    chunks.push(id)
+    if (id === 'fmt ') { formatPayload = payload; formatSize = size }
+    else if (id === 'data') { dataPayload = payload; dataSize = size }
+    offset = payload + size + (size % 2)
+  }
+  const floatingPoint = expected.format === 'float32'
+  const expectedBits = expected.format === 'float32' ? 32 : expected.format === 'pcm24' ? 24 : 16
+  const expectedSubFormat = floatingPoint ? 3 : 1
+  let formatValid = false, channelCount = 0, sampleRate = 0, bitsPerSample = 0
+  if (formatPayload >= 0 && formatSize >= 16) {
+    const tag = view.getUint16(formatPayload, true)
+    channelCount = view.getUint16(formatPayload + 2, true)
+    sampleRate = view.getUint32(formatPayload + 4, true)
+    bitsPerSample = view.getUint16(formatPayload + 14, true)
+    const subFormat = tag === 0xfffe && formatSize >= 40 ? view.getUint32(formatPayload + 24, true) : tag
+    formatValid = subFormat === expectedSubFormat && bitsPerSample === expectedBits
+  }
+  addCheck('File format', riffValid && chunksValid && formatValid, `${formatLabel(expected.format)}${riffValid && formatValid ? ' · valid WAV header' : ' · invalid WAV header'}`)
+  const layoutValid = channelCount === expected.channelCount && sampleRate === expected.sampleRate && dataSize === expected.frameCount * expected.channelCount * (expectedBits / 8) && dataPayload >= 0
+  addCheck('Channels and sample rate', layoutValid, `${channelCount} channel${channelCount === 1 ? '' : 's'} · ${sampleRate.toLocaleString()} Hz${layoutValid ? ' · preserved' : ' · mismatch'}`)
+  let samplePeak = 0
+  let finiteSamples = true
+  if (dataPayload >= 0 && formatValid) {
+    const bytesPerSample = expectedBits / 8
+    for (let sampleOffset = dataPayload; sampleOffset + bytesPerSample <= dataPayload + dataSize; sampleOffset += bytesPerSample) {
+      let sample: number
+      if (floatingPoint) {
+        sample = view.getFloat32(sampleOffset, true)
+        if (!Number.isFinite(sample)) finiteSamples = false
+      } else if (expectedBits === 24) {
+        let value = bytes[sampleOffset] | (bytes[sampleOffset + 1] << 8) | (bytes[sampleOffset + 2] << 16)
+        if (value & 0x800000) value -= 0x1000000
+        sample = value / 8388608
+      } else {
+        sample = view.getInt16(sampleOffset, true) / 32768
+      }
+      samplePeak = Math.max(samplePeak, Math.abs(sample))
+    }
+  } else finiteSamples = false
+  const peakPass = finiteSamples && samplePeak <= expected.peakCeiling + (floatingPoint ? 1e-7 : 1 / (expectedBits === 24 ? 8388608 : 32768))
+  addCheck('Peak / clipping', peakPass, `${formatDb(samplePeak)} · ${peakPass ? 'within ceiling' : 'over ceiling or invalid samples'}`)
+  const metadataPass = riffValid && chunksValid && chunks.length === 2 && chunks[0] === 'fmt ' && chunks[1] === 'data' && offset === bytes.length
+  addCheck('Metadata', metadataPass, metadataPass ? 'Source tags omitted; only format and audio data remain' : 'Unexpected or malformed WAV chunks found')
+  return checks
 }
 
 export const fmt = (t: number) => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, '0')}`

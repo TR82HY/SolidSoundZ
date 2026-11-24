@@ -3,7 +3,7 @@ import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { useSearchParams } from 'next/navigation'
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
-import { baseName, computePeaks, decodeFile, encodeWav, exportAudio, fmt, publishTrack, type FormatId } from '@/lib/audio'
+import { baseName, computePeaks, decodeFile, downloadBlob, encodeWav, fmt, FORMATS, publishTrack, renderExportBlob, validateWav, type FormatId, type WavCheck } from '@/lib/audio'
 import { buildChain, DEFAULTS, EQ_BANDS, PRESETS, renderMaster, TARGETS, dbToLin, parseStudioSettings, type Chain, type Settings } from '@/lib/studioChain'
 import { measureLoudness } from '@/lib/loudness'
 import { stopAll, transportBtn, useTransport } from '@/lib/transport'
@@ -97,6 +97,8 @@ export default function Studio() {
   const [analysis, setAnalysis] = useState<Analysis | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [format, setFormat] = useState<FormatId>('wav24')
+  const [keepRate, setKeepRate] = useState(false)
+  const [qc, setQc] = useState<WavCheck[] | null>(null)
   const [title, setTitle] = useState('')
   const [error, setError] = useState('')
   const [status, setStatus] = useState('')
@@ -404,8 +406,29 @@ export default function Studio() {
   const exportMaster = async () => {
     if (!buffer || !file) return
     await runJob('Rendering master...', async signal => {
-      await exportAudio(await renderMaster(buffer, s), format, `${baseName(file.name)}-SSZ-master`, signal)
-      if (!signal.aborted) setStatus('Master rendered. Your browser download has started.')
+      const rendered = await renderMaster(buffer, s)
+      if (signal.aborted) return
+      const f = FORMATS.find(x => x.id === format)!
+      const { blob, out } = await renderExportBlob(rendered, format, keepRate)
+      if (signal.aborted) return
+      if (format !== 'mp3') {
+        const checks = await validateWav(blob, {
+          channelCount: out.numberOfChannels,
+          frameCount: out.length,
+          format: format === 'wav32' ? 'float32' : format === 'wav24' ? 'pcm24' : 'pcm16',
+          peakCeiling: dbToLin(s.ceiling),
+          sampleRate: out.sampleRate,
+        })
+        setQc(checks)
+        if (!checks.every(c => c.pass)) {
+          setError('The export checker found an issue. Review the results below — the download was blocked.')
+          return
+        }
+      } else {
+        setQc(null)
+      }
+      downloadBlob(blob, `${baseName(file.name)}-SSZ-master.${f.ext}`)
+      if (!signal.aborted) setStatus('Master rendered and checked. Your browser download has started.')
     })
   }
 
@@ -565,11 +588,15 @@ export default function Studio() {
               <div className="grid grid-cols-2 gap-x-5 gap-y-3">
                 <Slider label="Output Gain" hint="Changes the level before the limiter and in your export. Use Monitor volume for listening only." value={s.outputGain} min={-12} max={24} unit=" dB" def={0} onChange={v => set('outputGain', v)} />
                 <Slider label="Peak Ceiling" hint="Caps sample peaks after processing. -1 dBFS is a useful starting point, not a true-peak guarantee." value={s.ceiling} min={-3} max={0} step={0.1} unit=" dBFS" def={-1} onChange={v => set('ceiling', v)} />
+                <Slider label="Limiter Release" hint="How quickly the limiter lets go after a loud peak. Shorter times can sound tighter; longer times sound smoother. Orbit Master uses 80 ms." value={s.limiterRelease} min={10} max={250} step={1} unit=" ms" digits={0} def={80} onChange={v => set('limiterRelease', v)} />
               </div>
               <div className="flex flex-wrap gap-2 mt-3">
                 <button onClick={() => matchLoudness()} disabled={!buffer || !!busy} className="px-3 py-2 rounded-lg bg-[#ccff00] text-black text-sm font-bold disabled:opacity-40">Match loudness to target</button>
                 <button onClick={() => runJob('Analyzing...', async () => { await analyze(); if (mounted.current) setStatus('Analysis updated for the current processing settings.') })} disabled={!buffer || !!busy} className="px-3 py-2 rounded-lg bg-[#222] border border-[#555] text-sm font-bold disabled:opacity-40">Analyze</button>
               </div>
+              <label className="mt-3 flex items-center gap-2 text-xs text-[#ccc]">
+                <input type="checkbox" checked={s.lookahead} onChange={e => set('lookahead', e.target.checked)} className="accent-[#ccff00]" /> Lookahead limiter (5 ms render-time safety pass)
+              </label>
               {analysis && (
                 <div role="group" aria-label="Loudness analysis" className="grid grid-cols-2 gap-3 mt-3 text-sm">
                   <div className="rounded bg-[#0a0a0a] border border-[#333] p-2"><div className="text-xs text-[#aaa]">{buffer?.numberOfChannels === 1 ? 'Original (stereo preview)' : 'Original'}</div><div className="font-mono">{lufsLabel(analysis.inLufs)}</div><div className="font-mono text-xs text-[#aaa]">{peakLabel(analysis.inPeak)}</div></div>
@@ -584,10 +611,23 @@ export default function Studio() {
             <div className="flex flex-wrap items-end gap-3">
               <label className="min-w-0 max-w-full"><span className="mb-1 block text-xs font-bold text-[#ddd]">Download format</span><FormatSelect value={format} onChange={setFormat} /></label>
               <button onClick={exportMaster} disabled={!buffer || !!busy} aria-describedby="studio-format-help" className="px-4 py-2 rounded-lg bg-white text-black text-sm font-bold disabled:opacity-40">Download master</button>
+              <label className="flex items-center gap-2 text-xs text-[#ccc]"><input type="checkbox" checked={keepRate} onChange={e => setKeepRate(e.target.checked)} aria-describedby="studio-format-help" className="accent-[#ccff00]" /> Keep original sample rate</label>
               <label className="min-w-0 basis-44 flex-1"><span className="mb-1 block text-xs font-bold text-[#ddd]">Release title</span><input value={title} onChange={e => setTitle(e.target.value)} maxLength={120} placeholder="Name your track" className="w-full bg-[#0a0a0a] border border-[#555] rounded-lg px-3 py-2 text-sm" /></label>
               <button onClick={masterAndPublish} disabled={!buffer || !!busy} aria-describedby="studio-publish-help" className="px-4 py-2 rounded-lg bg-[#ccff00] text-black text-sm font-bold disabled:opacity-40">Master &amp; Publish</button>
             </div>
-            <p id="studio-format-help" className="mt-3 text-xs leading-relaxed text-[#aaa]">Not sure which format? Start with WAV 24-bit / 48k for a high-quality master. MP3 makes a smaller listening copy. A higher export sample rate does not restore detail missing from the source.</p>
+            <p id="studio-format-help" className="mt-3 text-xs leading-relaxed text-[#aaa]">Not sure which format? Start with WAV 24-bit / 48k for a high-quality master. MP3 makes a smaller listening copy. A higher export sample rate does not restore detail missing from the source. Keep original sample rate skips resampling — the export stays at your mix's own rate instead of 44.1k / 48k / 96k.</p>
+            {qc && (
+              <div className="mt-3 rounded border border-[#333] bg-[#0a0a0a] p-3" role="group" aria-label="Export checker results">
+                <h3 className="text-[11px] uppercase tracking-wider text-[#aaa]">Export checker</h3>
+                <ul className="mt-2 space-y-1 text-xs">
+                  {qc.map(c => (
+                    <li key={c.label} className={c.pass ? 'text-[#ccff00]' : 'text-[#ff5a36]'}>
+                      {c.pass ? 'PASS' : 'FAIL'} · {c.label}: {c.detail}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             <p id="studio-publish-help" className="mt-2 text-xs leading-relaxed text-[#aaa]">Download stays on your device. Master &amp; Publish creates a public WAV track on your signed-in account; the download format only applies to Download master.</p>
             <div className="mt-4 border-t border-[#333] pt-3">
               <button onClick={() => { setS({ ...DEFAULTS, eq: [...DEFAULTS.eq] }); invalidateAnalysis() }} aria-describedby="studio-reset-help" className="text-sm text-[#ccc] underline">Reset processing</button>
